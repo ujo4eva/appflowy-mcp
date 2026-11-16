@@ -50,6 +50,11 @@ def test_base_url_strips_trailing_slash():
     assert client.base_url == "https://x"
 
 
+async def test_client_sends_explicit_user_agent():
+    client = AppFlowyClient(AppFlowyConfig(base_url="https://x"))
+    assert client._http.headers["User-Agent"].startswith("appflowy-mcp/")
+
+
 async def test_aclose_closes_http():
     http = FakeHTTP()
     client = make_client(http)

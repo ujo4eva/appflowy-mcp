@@ -129,6 +129,54 @@ def build_database_collab(rows_by_view):
     return {"doc_state": list(doc.get_update())}
 
 
+def build_fields_doc(fields, views):
+    """Build a Database collab Doc holding fields and views.
+
+    ``fields`` is ``{field_id: {"name", "ty", "is_primary"?, "type_option"?}}``
+    where ``type_option`` is ``{str(ty): {key: value}}``. ``views`` is
+    ``{view_id: {key: value}}``; list values become arrays of maps (for
+    ``field_orders``/``filters``/...), dict values become maps of maps (for
+    ``field_settings``).
+    """
+    doc = Doc()
+    root = doc.get("data", type=Map)
+    database = Map()
+    root["database"] = database
+    field_map = Map()
+    database["fields"] = field_map
+    for field_id, spec in fields.items():
+        type_option = Map(
+            {key: Map(opts) for key, opts in (spec.get("type_option") or {}).items()}
+        )
+        field_map[field_id] = Map(
+            {
+                "id": field_id,
+                "name": spec["name"],
+                "ty": spec["ty"],
+                "is_primary": spec.get("is_primary", False),
+                "last_modified": 0,
+                "type_option": type_option,
+            }
+        )
+    view_map = Map()
+    database["views"] = view_map
+    for view_id, spec in views.items():
+        view = Map()
+        view_map[view_id] = view
+        for key, value in spec.items():
+            if isinstance(value, list):
+                arr = Array()
+                view[key] = arr
+                for entry in value:
+                    arr.append(Map(entry))
+            else:
+                settings = Map()
+                view[key] = settings
+                for sub_key, sub_value in value.items():
+                    settings[sub_key] = Map(sub_value)
+    return doc
+
+
 class FakeResponse:
     """Minimal stand-in for ``httpx.Response``."""
 

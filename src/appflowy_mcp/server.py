@@ -16,7 +16,7 @@ from fastmcp.server.dependencies import get_http_headers
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from . import blocks, rows
+from . import blocks, fields, rows
 from .access import AccessControl, AccessDenied
 from .appflowy import AppFlowyClient, AppFlowyError, unwrap
 from .config import Settings, load_settings
@@ -85,6 +85,17 @@ async def _api(method: str, path: str, **kw) -> Any:
         raise ToolError(str(exc)) from exc
 
 
+def _reject_workspace_root(workspace_id: str, parent_view_id: str) -> None:
+    # The folder root's view id is the workspace id. Views parented there that
+    # are not spaces exist in the API but are never listed by any client.
+    if parent_view_id == workspace_id:
+        raise ToolError(
+            "parent_view_id is the workspace root: pages there are invisible in "
+            "AppFlowy's sidebar, which only lists spaces. Pick a space (or a page "
+            "inside one) from 'Get workspace folder', or create one with 'Create space'."
+        )
+
+
 # --------------------------------------------------------------------------
 # Workspace + folder
 # --------------------------------------------------------------------------
@@ -147,6 +158,7 @@ async def create_new_page(
             accept attributes: bold, italic, underline, strikethrough, code,
             color, href.
     """
+    _reject_workspace_root(workspace_id, parent_view_id)
     await _guard_view(workspace_id, parent_view_id)
     json_data: dict[str, Any] = {"parent_view_id": parent_view_id, "layout": view_layout}
     if name:
@@ -174,18 +186,27 @@ async def update_page(
     """Update a page's metadata (name, icon, locked state). Only provided
     fields change.
 
+    This cannot turn a page into a space; use 'Create space' and 'Move page'.
+
     Args:
         workspace_id: The workspace containing the page.
         page_id: The page to update; must be within your scope.
-        name: Optional new title.
+        name: Optional new title (the current one is kept when omitted).
         icon: Optional icon object.
         is_locked: Optional lock/unlock.
         extra: Optional extra metadata.
     """
     await _guard_view(workspace_id, page_id)
-    data: dict[str, Any] = {}
-    if name is not None:
-        data["name"] = name
+    if name is None:
+        # AppFlowy's PATCH requires `name` even when only other fields change.
+        current = unwrap(
+            await _api("GET", f"/api/workspace/{workspace_id}/page-view/{page_id}")
+        )
+        try:
+            name = current["view"]["name"]
+        except (KeyError, TypeError) as exc:
+            raise ToolError(f"could not read the current name of page {page_id!r}") from exc
+    data: dict[str, Any] = {"name": name}
     if icon is not None:
         data["icon"] = icon
     if is_locked is not None:
@@ -201,12 +222,27 @@ async def update_page(
 async def get_page_details(workspace_id: str, page_id: str) -> Any:
     """Get full details (metadata + content) of a page within your scope.
 
+    The raw CRDT state is replaced by the page's blocks (as 'Get page blocks'
+    returns them) when it is a document; for other layouts it is dropped.
+
     Args:
         workspace_id: The workspace containing the page.
         page_id: The page to read.
     """
     await _guard_view(workspace_id, page_id)
-    return await _api("GET", f"/api/workspace/{workspace_id}/page-view/{page_id}")
+    payload = await _api("GET", f"/api/workspace/{workspace_id}/page-view/{page_id}")
+    inner = unwrap(payload)
+    content = inner.get("data") if isinstance(inner, dict) else None
+    if not isinstance(content, dict) or "encoded_collab" not in content:
+        return payload
+    encoded = content.pop("encoded_collab")
+    if blocks.HAS_PYCRDT:
+        try:
+            _doc, document = blocks.load_document(bytes(encoded))
+            content["blocks"] = blocks.ordered_blocks(document)
+        except Exception:  # noqa: BLE001 - not a document collab; nothing to render
+            pass
+    return payload
 
 
 @mcp.tool(name="append_content_to_page")
@@ -228,6 +264,77 @@ async def append_content_to_page(
         f"/api/workspace/{workspace_id}/page-view/{page_id}/append-block",
         json={"blocks": blocks_to_add},
     )
+
+
+@mcp.tool(name="create_space")
+async def create_space(
+    workspace_id: str,
+    name: str,
+    icon: str = "interface_essential/home-3",
+    icon_color: str = "0xFFA34AFD",
+    private: bool = False,
+) -> Any:
+    """Create a space: a top-level sidebar section (like "General").
+
+    AppFlowy's sidebar only lists spaces, so top-level content needs one. A page
+    cannot be converted into a space; create the space, then 'Move page' into it.
+    Requires a token that reaches the whole workspace.
+
+    Args:
+        workspace_id: The workspace to create in.
+        name: The space's name.
+        icon: Icon id from AppFlowy's icon set, e.g.
+            "interface_essential/archive-book".
+        icon_color: ARGB colour as "0xAARRGGBB".
+        private: True for a private space (only you can see it).
+    """
+    tok = _guard_workspace(workspace_id)
+    if not ACCESS.workspace_wide(tok, workspace_id):
+        raise ToolError(
+            f"token '{tok.name or '?'}' is scoped to part of workspace {workspace_id}; "
+            "creating a space needs whole-workspace access"
+        )
+    result = await _api(
+        "POST",
+        f"/api/workspace/{workspace_id}/space",
+        json={
+            "name": name,
+            "space_icon": icon,
+            "space_icon_color": icon_color,
+            "space_permission": 1 if private else 0,
+        },
+    )
+    ACCESS.invalidate(workspace_id)
+    return result
+
+
+@mcp.tool(name="move_page")
+async def move_page(
+    workspace_id: str,
+    page_id: str,
+    new_parent_view_id: str,
+    prev_view_id: str | None = None,
+) -> Any:
+    """Move a page (with its children) under a different parent.
+
+    Args:
+        workspace_id: The workspace containing the page.
+        page_id: The page to move; must be within your scope.
+        new_parent_view_id: The space or page to move it under; must be within
+            your scope and not the workspace root.
+        prev_view_id: Optional sibling to place it after; omitted = first.
+    """
+    _reject_workspace_root(workspace_id, new_parent_view_id)
+    await _guard_view(workspace_id, page_id)
+    await _guard_view(workspace_id, new_parent_view_id)
+    body: dict[str, Any] = {"new_parent_view_id": new_parent_view_id}
+    if prev_view_id:
+        body["prev_view_id"] = prev_view_id
+    result = await _api(
+        "POST", f"/api/workspace/{workspace_id}/page-view/{page_id}/move", json=body
+    )
+    ACCESS.invalidate(workspace_id)
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -491,6 +598,7 @@ async def create_database(
         name: Optional database title.
         layout: 1=Grid, 2=Board, 3=Calendar.
     """
+    _reject_workspace_root(workspace_id, parent_view_id)
     await _guard_view(workspace_id, parent_view_id)
     if layout not in (1, 2, 3):
         raise ToolError("layout must be 1 (Grid), 2 (Board), or 3 (Calendar)")
@@ -584,8 +692,13 @@ async def add_database_field(
     name: str,
     field_type: int = 0,
     type_option_data: dict | None = None,
+    allow_duplicate_name: bool = False,
 ) -> Any:
     """Add a field/column to a database. Returns the new field id.
+
+    Refuses a name the database already has (new databases start with Name,
+    Type and Done), since cells are addressed by field name. For select options
+    use 'Add select options' afterwards.
 
     Args:
         workspace_id: The workspace containing the database.
@@ -596,8 +709,16 @@ async def add_database_field(
             10=Relation, 11=Summary, 12=Translate, 13=Time, 14=Media.
         type_option_data: Optional type-specific config, e.g. {"format": 1} for a
             Number field.
+        allow_duplicate_name: Add the field even if the name is taken.
     """
     await _guard_database(workspace_id, database_id)
+    if not allow_duplicate_name:
+        existing = await _database_fields(workspace_id, database_id)
+        if any(isinstance(f, dict) and f.get("name") == name for f in existing):
+            raise ToolError(
+                f"database {database_id!r} already has a field named {name!r}; reuse it, "
+                "rename it with 'Rename database field', or pass allow_duplicate_name"
+            )
     body: dict[str, Any] = {"name": name, "field_type": field_type}
     if type_option_data is not None:
         body["type_option_data"] = type_option_data
@@ -656,6 +777,38 @@ async def create_database_row(
     return await _api(
         "POST", f"/api/workspace/{workspace_id}/database/{database_id}/row", json=body
     )
+
+
+@mcp.tool(name="create_database_rows")
+async def create_database_rows(
+    workspace_id: str,
+    database_id: str,
+    rows_to_add: list,
+) -> Any:
+    """Create several rows in one call, in order. Returns each new row id.
+
+    Stops at the first failure and reports which rows were created before it.
+
+    Args:
+        workspace_id: The workspace containing the database.
+        database_id: The database to edit; must be within your scope.
+        rows_to_add: List of {"cells": {...}, "document": "optional markdown"},
+            with cells as in 'Create database row'.
+    """
+    await _guard_database(workspace_id, database_id)
+    path = f"/api/workspace/{workspace_id}/database/{database_id}/row"
+    created: list = []
+    for i, row in enumerate(rows_to_add):
+        if not isinstance(row, dict) or not isinstance(row.get("cells"), dict):
+            raise ToolError(f"rows_to_add[{i}] needs a 'cells' object; created so far: {created}")
+        body: dict[str, Any] = {"cells": row["cells"]}
+        if row.get("document") is not None:
+            body["document"] = row["document"]
+        try:
+            created.append(unwrap(await CLIENT.request("POST", path, json=body)))
+        except AppFlowyError as exc:
+            raise ToolError(f"rows_to_add[{i}] failed: {exc}; created so far: {created}") from exc
+    return {"created": created}
 
 
 async def _database_fields(workspace_id: str, database_id: str) -> list:
@@ -742,6 +895,91 @@ async def delete_database_row(
     return await CLIENT.post_web_update(
         workspace_id, database_id, doc.get_update(state), rows.COLLAB_DATABASE
     )
+
+
+async def _edit_database_collab(workspace_id: str, database_id: str, edit) -> Any:
+    """Run ``edit(doc)`` on the database collab and publish the change.
+
+    ``edit`` raises ValueError for a bad request; its return value is passed back
+    alongside the web-update result.
+    """
+    if not blocks.HAS_PYCRDT:
+        raise ToolError("pycrdt is not installed; field editing is unavailable")
+    await _guard_database(workspace_id, database_id)
+    doc = await _load_collab(workspace_id, database_id, rows.COLLAB_DATABASE)
+    state = doc.get_state()
+    try:
+        with doc.transaction():
+            outcome = edit(doc)
+    except ValueError as exc:
+        raise ToolError(f"database {database_id!r}: {exc}") from exc
+    result = await CLIENT.post_web_update(
+        workspace_id, database_id, doc.get_update(state), rows.COLLAB_DATABASE
+    )
+    return result, outcome
+
+
+@mcp.tool(name="rename_database_field")
+async def rename_database_field(
+    workspace_id: str, database_id: str, field_id: str, name: str
+) -> Any:
+    """Rename a field/column.
+
+    Args:
+        workspace_id: The workspace containing the database.
+        database_id: The database to edit; must be within your scope.
+        field_id: The field's id (from 'Get database fields'); ids stay unique
+            even when names are duplicated.
+        name: The new name.
+    """
+    result, _ = await _edit_database_collab(
+        workspace_id, database_id, lambda doc: fields.rename_field(doc, field_id, name)
+    )
+    return result
+
+
+@mcp.tool(name="delete_database_field")
+async def delete_database_field(workspace_id: str, database_id: str, field_id: str) -> Any:
+    """Delete a field/column from the database and all of its views.
+
+    The primary field cannot be deleted. Cell values stay in the row data but
+    are no longer shown.
+
+    Args:
+        workspace_id: The workspace containing the database.
+        database_id: The database to edit; must be within your scope.
+        field_id: The field's id (from 'Get database fields').
+    """
+    result, _ = await _edit_database_collab(
+        workspace_id, database_id, lambda doc: fields.delete_field(doc, field_id)
+    )
+    return result
+
+
+@mcp.tool(name="add_select_options")
+async def add_select_options(
+    workspace_id: str, database_id: str, field_id: str, options: list
+) -> Any:
+    """Add options to a SingleSelect or MultiSelect field.
+
+    Options that already exist (by name) are skipped. Colours are assigned in
+    AppFlowy's default order.
+
+    Args:
+        workspace_id: The workspace containing the database.
+        database_id: The database to edit; must be within your scope.
+        field_id: The select field's id (from 'Get database fields').
+        options: Option names, e.g. ["Revision", "Assignment", "Project"].
+    """
+    names = [str(o).strip() for o in options if str(o).strip()]
+    if not names:
+        raise ToolError("options must contain at least one non-empty name")
+    result, added = await _edit_database_collab(
+        workspace_id,
+        database_id,
+        lambda doc: fields.add_select_options(doc, field_id, names),
+    )
+    return {"added": added, "result": result}
 
 
 # --------------------------------------------------------------------------
@@ -846,7 +1084,7 @@ async def toggle_favorite_page(
     return await _api(
         "POST",
         f"/api/workspace/{workspace_id}/page-view/{page_id}/favorite",
-        json={"is_favorite": is_favorite},
+        json={"is_favorite": is_favorite, "is_pinned": False},
     )
 
 

@@ -15,7 +15,12 @@ from appflowy_mcp.config import (
     Settings,
     TokenConfig,
 )
-from tests.conftest import build_collab, build_database_collab, build_row_collab
+from tests.conftest import (
+    build_collab,
+    build_database_collab,
+    build_fields_doc,
+    build_row_collab,
+)
 
 
 def page_view_for(collab_bytes):
@@ -121,14 +126,101 @@ async def test_update_page_sets_all_fields(fake_client):
     assert body == {"name": "n", "icon": {"i": 1}, "is_locked": True, "extra": {"e": 1}}
 
 
-async def test_update_page_empty_when_nothing_provided(fake_client):
-    await server.update_page("WS", "P")
-    assert fake_client.requests[0][2]["json"] == {}
+async def test_update_page_name_only_sends_just_name(fake_client):
+    await server.update_page("WS", "P", name="n")
+    assert fake_client.requests[0][2]["json"] == {"name": "n"}
+
+
+async def test_update_page_keeps_current_name_when_omitted(fake_client):
+    fake_client.results["/page-view/P"] = {"data": {"view": {"name": "Current"}}}
+    await server.update_page("WS", "P", icon={"i": 1})
+    assert fake_client.requests[-1][2]["json"] == {"name": "Current", "icon": {"i": 1}}
+
+
+async def test_update_page_unreadable_current_name_raises(fake_client):
+    fake_client.results["/page-view/P"] = {"data": {}}
+    with pytest.raises(ToolError, match="current name"):
+        await server.update_page("WS", "P", is_locked=True)
+
+
+async def test_create_new_page_rejects_workspace_root():
+    with pytest.raises(ToolError, match="workspace root"):
+        await server.create_new_page("WS", "WS", name="x")
 
 
 async def test_get_page_details_hits_endpoint(fake_client):
     await server.get_page_details("WS", "P")
     assert fake_client.requests[0][1].endswith("/page-view/P")
+
+
+async def test_get_page_details_replaces_collab_with_blocks(fake_client):
+    collab = build_collab(blocks=[{"id": "b1", "text": "hi"}])
+    fake_client.request_result = {"data": {"view": {}, "data": {"encoded_collab": list(collab)}}}
+    result = await server.get_page_details("WS", "P")
+    assert result["data"]["data"]["blocks"][0]["text"] == "hi"
+
+
+async def test_get_page_details_drops_undecodable_collab(fake_client):
+    fake_client.request_result = {"data": {"view": {}, "data": {"encoded_collab": [1, 2, 3]}}}
+    result = await server.get_page_details("WS", "P")
+    assert result["data"]["data"] == {}
+
+
+async def test_get_page_details_drops_collab_without_pycrdt(monkeypatch, fake_client):
+    monkeypatch.setattr(blocks, "HAS_PYCRDT", False)
+    collab = build_collab(blocks=[{"id": "b1", "text": "hi"}])
+    fake_client.request_result = {"data": {"view": {}, "data": {"encoded_collab": list(collab)}}}
+    result = await server.get_page_details("WS", "P")
+    assert result["data"]["data"] == {}
+
+
+# -- spaces + moving -------------------------------------------------------
+async def test_create_space_posts_public_space(fake_client):
+    await server.create_space("WS", "School", icon="i", icon_color="c")
+    assert fake_client.requests[0][2]["json"] == {
+        "name": "School",
+        "space_icon": "i",
+        "space_icon_color": "c",
+        "space_permission": 0,
+    }
+
+
+async def test_create_space_private_sets_permission(fake_client):
+    await server.create_space("WS", "Mine", private=True)
+    assert fake_client.requests[0][2]["json"]["space_permission"] == 1
+
+
+async def test_create_space_hits_space_endpoint(fake_client):
+    await server.create_space("WS", "School")
+    assert fake_client.requests[0][1] == "/api/workspace/WS/space"
+
+
+async def test_create_space_rejects_view_scoped_token(fake_client, headers):
+    tok = TokenConfig(token="t", scopes=(ScopeEntry("WS", "ROOT"),))
+    server.ACCESS = AccessControl(fake_client, [tok])
+    headers["authorization"] = "Bearer t"
+    with pytest.raises(ToolError, match="whole-workspace access"):
+        await server.create_space("WS", "School")
+
+
+async def test_move_page_posts_new_parent(fake_client):
+    await server.move_page("WS", "P", "SPACE")
+    assert fake_client.requests[0][2]["json"] == {"new_parent_view_id": "SPACE"}
+
+
+async def test_move_page_includes_prev_view_id(fake_client):
+    await server.move_page("WS", "P", "SPACE", prev_view_id="SIB")
+    assert fake_client.requests[0][2]["json"]["prev_view_id"] == "SIB"
+
+
+async def test_move_page_hits_move_endpoint(fake_client):
+    await server.move_page("WS", "P", "SPACE")
+    assert fake_client.requests[0][1] == "/api/workspace/WS/page-view/P/move"
+
+
+async def test_move_page_rejects_workspace_root():
+    with pytest.raises(ToolError, match="workspace root"):
+        await server.move_page("WS", "P", "WS")
 
 
 async def test_append_content_to_page_sends_blocks(fake_client):
@@ -461,15 +553,113 @@ async def test_get_database_row_with_doc_param(fake_client):
 
 
 async def test_add_database_field_minimal(fake_client):
+    fake_client.results["/fields"] = {"data": []}
     await server.add_database_field("WS", "DB", "Notes", field_type=0)
-    assert fake_client.requests[0][2]["json"] == {"name": "Notes", "field_type": 0}
+    assert fake_client.requests[-1][2]["json"] == {"name": "Notes", "field_type": 0}
 
 
 async def test_add_database_field_with_type_option(fake_client):
+    fake_client.results["/fields"] = {"data": []}
     await server.add_database_field(
         "WS", "DB", "Qty", field_type=1, type_option_data={"format": 1}
     )
-    assert fake_client.requests[0][2]["json"]["type_option_data"] == {"format": 1}
+    assert fake_client.requests[-1][2]["json"]["type_option_data"] == {"format": 1}
+
+
+async def test_add_database_field_rejects_duplicate_name(fake_client):
+    fake_client.results["/fields"] = {"data": [{"id": "f1", "name": "Type"}]}
+    with pytest.raises(ToolError, match="already has a field named 'Type'"):
+        await server.add_database_field("WS", "DB", "Type", field_type=3)
+
+
+async def test_add_database_field_allows_duplicate_when_asked(fake_client):
+    await server.add_database_field(
+        "WS", "DB", "Type", field_type=3, allow_duplicate_name=True
+    )
+    assert fake_client.requests[0][0] == "POST"
+
+
+async def test_create_database_rejects_workspace_root():
+    with pytest.raises(ToolError, match="workspace root"):
+        await server.create_database("WS", "WS")
+
+
+# -- create_database_rows --------------------------------------------------
+async def test_create_database_rows_returns_created_ids(fake_client):
+    fake_client.request_result = {"code": 0, "data": "row-id"}
+    result = await server.create_database_rows(
+        "WS", "DB", [{"cells": {"Name": "a"}}, {"cells": {"Name": "b"}}]
+    )
+    assert result == {"created": ["row-id", "row-id"]}
+
+
+async def test_create_database_rows_sends_document(fake_client):
+    await server.create_database_rows("WS", "DB", [{"cells": {}, "document": "# hi"}])
+    assert fake_client.requests[0][2]["json"] == {"cells": {}, "document": "# hi"}
+
+
+async def test_create_database_rows_rejects_row_without_cells():
+    with pytest.raises(ToolError, match=r"rows_to_add\[0\] needs a 'cells' object"):
+        await server.create_database_rows("WS", "DB", [{"Name": "a"}])
+
+
+async def test_create_database_rows_reports_partial_failure(fake_client):
+    calls = []
+
+    async def flaky(method, path, **kw):
+        calls.append(kw)
+        if len(calls) == 2:
+            raise AppFlowyError("boom")
+        return {"data": "r1"}
+
+    fake_client.request = flaky
+    with pytest.raises(ToolError, match=r"rows_to_add\[1\] failed: boom; created so far: \['r1'\]"):
+        await server.create_database_rows("WS", "DB", [{"cells": {}}, {"cells": {}}])
+
+
+# -- field editing ---------------------------------------------------------
+def field_db_state():
+    doc = build_fields_doc(
+        {"n": {"name": "Name", "ty": 0, "is_primary": True}, "t": {"name": "Type", "ty": 3}},
+        {"V": {"field_orders": [{"id": "n"}, {"id": "t"}]}},
+    )
+    return {"doc_state": list(doc.get_update())}
+
+
+async def test_rename_database_field_posts_database_update(fake_client):
+    fake_client.collabs["DB"] = field_db_state()
+    await server.rename_database_field("WS", "DB", "t", "Kind")
+    ws, obj, _update, collab_type = fake_client.web_updates[-1]
+    assert (ws, obj, collab_type) == ("WS", "DB", rows.COLLAB_DATABASE)
+
+
+async def test_delete_database_field_posts_database_update(fake_client):
+    fake_client.collabs["DB"] = field_db_state()
+    await server.delete_database_field("WS", "DB", "t")
+    assert fake_client.web_updates[-1][1] == "DB"
+
+
+async def test_delete_database_field_primary_raises(fake_client):
+    fake_client.collabs["DB"] = field_db_state()
+    with pytest.raises(ToolError, match="primary"):
+        await server.delete_database_field("WS", "DB", "n")
+
+
+async def test_delete_database_field_requires_pycrdt(monkeypatch):
+    monkeypatch.setattr(blocks, "HAS_PYCRDT", False)
+    with pytest.raises(ToolError, match="pycrdt is not installed"):
+        await server.delete_database_field("WS", "DB", "t")
+
+
+async def test_add_select_options_returns_added(fake_client):
+    fake_client.collabs["DB"] = field_db_state()
+    result = await server.add_select_options("WS", "DB", "t", ["Revision", " "])
+    assert [o["name"] for o in result["added"]] == ["Revision"]
+
+
+async def test_add_select_options_rejects_empty_list():
+    with pytest.raises(ToolError, match="at least one"):
+        await server.add_select_options("WS", "DB", "t", ["", "  "])
 
 
 async def test_create_database_row_minimal(fake_client):
@@ -600,7 +790,7 @@ async def test_get_favorite_pages_non_list_passthrough(fake_client):
 
 async def test_toggle_favorite_page(fake_client):
     await server.toggle_favorite_page("WS", "P", is_favorite=False)
-    assert fake_client.requests[0][2]["json"] == {"is_favorite": False}
+    assert fake_client.requests[0][2]["json"] == {"is_favorite": False, "is_pinned": False}
 
 
 # -- health check ----------------------------------------------------------

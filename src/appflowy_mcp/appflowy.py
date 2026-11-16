@@ -14,9 +14,12 @@ from typing import Any
 
 import httpx
 
+from . import __version__
 from .config import AppFlowyConfig
 
 log = logging.getLogger("appflowy_mcp.client")
+
+USER_AGENT = f"appflowy-mcp/{__version__}"
 
 
 class AppFlowyError(RuntimeError):
@@ -41,7 +44,9 @@ class AppFlowyClient:
         self._base_url = config.base_url.rstrip("/")
         self._token: str | None = config.access_token
         self._login_lock = asyncio.Lock()
-        self._http = httpx.AsyncClient(timeout=30.0)
+        # An explicit UA: Cloudflare in front of some instances blocks generic
+        # library signatures (error 1010).
+        self._http = httpx.AsyncClient(timeout=30.0, headers={"User-Agent": USER_AGENT})
 
     @property
     def base_url(self) -> str:
