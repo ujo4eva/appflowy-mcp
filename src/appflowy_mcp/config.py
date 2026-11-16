@@ -103,6 +103,10 @@ class Settings:
     require_auth: bool = True
     folder_cache_ttl: float = 15.0
     log_level: str = "INFO"
+    # uvicorn's own default is 5 s and it does not advertise it, so clients that
+    # reuse a pooled connection after 5 s idle get a reset. Keep it well above
+    # typical client pool timeouts so the client always closes first.
+    keepalive_timeout: int = 75
 
 
 def _split_list(raw: str) -> list[str]:
@@ -224,6 +228,11 @@ def load_settings() -> Settings:
         or 15.0
     )
     log_level = os.getenv("APPFLOWY_MCP_LOG_LEVEL") or server_file.get("log_level") or "INFO"
+    keepalive = int(
+        os.getenv("APPFLOWY_MCP_KEEPALIVE_TIMEOUT")
+        or server_file.get("keepalive_timeout")
+        or 75
+    )
 
     return Settings(
         appflowy=appflowy,
@@ -234,4 +243,5 @@ def load_settings() -> Settings:
         require_auth=require_auth,
         folder_cache_ttl=ttl,
         log_level=str(log_level).upper(),
+        keepalive_timeout=keepalive,
     )

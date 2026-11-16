@@ -193,3 +193,80 @@ def test_remove_row_orders_returns_zero_when_absent():
 def test_remove_row_orders_skips_views_without_row_orders():
     doc = rows.load_collab(build_database_collab({"v1": None}))
     assert rows.remove_row_orders(doc, "r1") == 0
+
+
+# -- dates with time / ranges ----------------------------------------------
+def test_has_time_false_for_midnight_seconds():
+    assert rows._has_time(1795392000) is False
+
+
+def test_has_time_true_for_seconds_with_time():
+    assert rows._has_time(1795392000 + 3600) is True
+
+
+def test_has_time_reads_digit_strings():
+    assert rows._has_time("1795395600") is True
+
+
+def test_has_time_false_for_iso_date():
+    assert rows._has_time("2026-12-05") is False
+
+
+def test_has_time_true_for_iso_datetime():
+    assert rows._has_time("2026-11-17T05:30:00+01:00") is True
+
+
+def test_date_extras_for_plain_date():
+    assert rows.date_extras("2026-12-05") == {
+        "include_time": False,
+        "is_range": False,
+        "end_timestamp": "",
+    }
+
+
+def test_date_extras_for_range():
+    extras = rows.date_extras({"start": "2026-11-23T08:00:00Z", "end": "2026-11-23T11:00:00Z"})
+    assert extras == {"include_time": True, "is_range": True, "end_timestamp": "1795431600"}
+
+
+def test_date_extras_range_without_end_is_not_a_range():
+    assert rows.date_extras({"start": "2026-11-23"})["is_range"] is False
+
+
+def test_date_extras_range_without_start_raises():
+    with pytest.raises(ValueError, match="needs a 'start'"):
+        rows.date_extras({"end": "2026-11-23"})
+
+
+def test_encode_cell_date_range_stores_start():
+    assert rows.encode_cell(DATETIME, {"start": 1700000000, "end": 1700003600}) == "1700000000"
+
+
+def test_resolve_cells_date_carries_extras():
+    resolved = rows.resolve_cells([DATETIME], {"When": "2026-12-05"})
+    assert resolved["d1"][2]["include_time"] is False
+
+
+def test_write_cells_sets_date_extras_on_new_cell():
+    doc = rows.load_collab(build_row_collab())
+    rows.write_cells(doc, {"d1": (rows.DATETIME, "1", {"include_time": True})})
+    cell = doc.get("data", type=blocks.YMap)["data"]["cells"]["d1"]
+    assert cell["include_time"] is True
+
+
+def test_write_cells_sets_date_extras_on_existing_cell():
+    doc = rows.load_collab(build_row_collab({"d1": {"field_type": 2, "data": "0"}}))
+    rows.write_cells(doc, {"d1": (rows.DATETIME, "1", {"is_range": True})})
+    cell = doc.get("data", type=blocks.YMap)["data"]["cells"]["d1"]
+    assert cell["is_range"] is True
+
+
+# -- clear_row_orders ------------------------------------------------------
+def test_clear_row_orders_empties_every_view():
+    doc = rows.load_collab(build_database_collab({"A": ["r1", "r2"], "B": ["r1"]}))
+    assert rows.clear_row_orders(doc) == 3
+
+
+def test_clear_row_orders_skips_views_without_orders():
+    doc = rows.load_collab(build_database_collab({"A": None, "B": []}))
+    assert rows.clear_row_orders(doc) == 0

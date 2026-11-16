@@ -124,16 +124,135 @@ def ordered_blocks(document) -> list:
     return out
 
 
+# Container and embed blocks carry no rich text of their own.
+NON_TEXT_TYPES = frozenset(
+    {
+        "page",
+        "simple_table",
+        "simple_table_row",
+        "simple_table_cell",
+        "table",
+        "table/cell",
+        "divider",
+        "image",
+    }
+)
+
+
+def _node_delta(node: dict):
+    data = node.get("data") or {}
+    if "delta" in data:
+        return data["delta"]
+    if node.get("text"):
+        return [{"insert": node["text"]}]
+    return None
+
+
+def _create_tree(block_map, text_map, children_map, parent: str, node: dict) -> str:
+    """Create ``node`` and its descendants; returns the new block id.
+
+    The caller links the returned id into the parent's children array. Children
+    are linked here in list order, which is what AppFlowy's append-block endpoint
+    gets wrong for nested blocks.
+    """
+    block_type = node.get("type") or "paragraph"
+    data = {k: v for k, v in (node.get("data") or {}).items() if k != "delta"}
+    block_id = new_id()
+    children_id = new_id()
+    children_map[children_id] = YArray()
+    text_id = ""
+    if block_type not in NON_TEXT_TYPES:
+        text_id = new_id()
+        text_map[text_id] = YText()
+        delta = _node_delta(node)
+        if delta:
+            apply_delta_to_text(text_map[text_id], delta)
+    block_map[block_id] = YMap(
+        {
+            "id": block_id,
+            "ty": block_type,
+            "data": json.dumps(data),
+            "parent": parent,
+            "children": children_id,
+            "external_id": text_id,
+            "external_type": "text" if text_id else "",
+        }
+    )
+    for child in node.get("children") or []:
+        child_id = _create_tree(block_map, text_map, children_map, block_id, child)
+        children_map[children_id].append(child_id)
+    return block_id
+
+
+def insert_tree(document, node: dict, parent_id: str = "", index: int = -1) -> str:
+    """Insert a block tree under ``parent_id`` ("" = page root) at ``index``.
+
+    ``node`` is ``{"type", "data": {..., "delta": [...]}, "children": [...]}``
+    (``"text"`` is accepted as plain-text shorthand). Raises ValueError when the
+    parent cannot take children. Call inside a transaction.
+    """
+    block_map = document["blocks"]
+    meta = document["meta"]
+    if "children_map" not in ykeys(meta):
+        raise ValueError("document has no children_map; cannot position blocks")
+    children_map = meta["children_map"]
+    page_root = str(document["page_id"]) if "page_id" in ykeys(document) else None
+    parent = parent_id or page_root
+    if not parent or parent not in ykeys(block_map):
+        raise ValueError(f"parent block {parent!r} not found on this page")
+    parent_children_id = block_map[parent]["children"]
+    if not parent_children_id or parent_children_id not in ykeys(children_map):
+        raise ValueError(f"parent block {parent!r} has no children array")
+    new_block = _create_tree(block_map, meta["text_map"], children_map, parent, node)
+    arr = children_map[parent_children_id]
+    n = len(arr)
+    arr.insert(n if index < 0 or index > n else index, new_block)
+    return new_block
+
+
+def table_node(rows: list, header_row: bool = True) -> dict:
+    """Build a ``simple_table`` tree (the table type current AppFlowy clients
+    create) from rows of cell text; short rows are padded with empty cells."""
+    if not all(isinstance(r, list) for r in rows):
+        raise ValueError("rows must be a list of lists of cells")
+    width = max((len(r) for r in rows), default=0)
+    if not rows or width == 0:
+        raise ValueError("a table needs at least one row with one cell")
+
+    def cell(value) -> dict:
+        para: dict = {"type": "paragraph"}
+        if isinstance(value, list):
+            para["data"] = {"delta": value}
+        elif value not in (None, ""):
+            para["text"] = str(value)
+        return {"type": "simple_table_cell", "children": [para]}
+
+    return {
+        "type": "simple_table",
+        "data": {"enable_header_row": bool(header_row), "enable_header_column": False},
+        "children": [
+            {
+                "type": "simple_table_row",
+                "children": [cell(r[i] if i < len(r) else "") for i in range(width)],
+            }
+            for r in rows
+        ],
+    }
+
+
 __all__ = [
     "HAS_PYCRDT",
+    "NON_TEXT_TYPES",
     "YArray",
     "YMap",
     "YText",
     "apply_delta_to_text",
     "block_data_json",
     "block_text",
+    "insert_tree",
     "load_document",
     "new_id",
     "ordered_blocks",
+    "table_node",
     "ykeys",
 ]

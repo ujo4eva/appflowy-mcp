@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from pycrdt import Array, Doc, Map, Text
 
 from appflowy_mcp import blocks
@@ -209,3 +210,138 @@ def test_ordered_blocks_fallback_when_root_has_no_children_array():
     _doc, document = blocks.load_document(collab)
     ids = {b["id"] for b in blocks.ordered_blocks(document)}
     assert ids == {"X"}
+
+
+# -- insert_tree -----------------------------------------------------------
+def loaded(blocks_spec=None, **kw):
+    return blocks.load_document(build_collab(blocks=blocks_spec, **kw))
+
+
+def root_children(document):
+    meta = document["meta"]
+    return [str(x) for x in meta["children_map"][document["blocks"]["root"]["children"]]]
+
+
+def child_ids(document, block_id):
+    meta = document["meta"]
+    return [str(x) for x in meta["children_map"][document["blocks"][block_id]["children"]]]
+
+
+def test_insert_tree_appends_to_page_root_by_default():
+    _doc, document = loaded([{"id": "a", "text": "a"}])
+    new = blocks.insert_tree(document, {"text": "x"})
+    assert root_children(document) == ["a", new]
+
+
+def test_insert_tree_honours_index():
+    _doc, document = loaded([{"id": "a", "text": "a"}])
+    new = blocks.insert_tree(document, {"text": "x"}, index=0)
+    assert root_children(document) == [new, "a"]
+
+
+def test_insert_tree_nests_under_parent_id():
+    _doc, document = loaded([{"id": "a", "text": "a"}])
+    new = blocks.insert_tree(document, {"text": "x"}, parent_id="a")
+    assert child_ids(document, "a") == [new]
+
+
+def test_insert_tree_keeps_children_in_list_order():
+    _doc, document = loaded()
+    node = {
+        "type": "bulleted_list",
+        "children": [
+            {"text": "1", "children": [{"text": "1a"}]},
+            {"text": "2"},
+        ],
+    }
+    new = blocks.insert_tree(document, node)
+    kids = child_ids(document, new)
+    assert [blocks.block_text(document, k) for k in kids] == ["1", "2"]
+
+
+def test_insert_tree_uses_delta_over_text():
+    _doc, document = loaded()
+    new = blocks.insert_tree(document, {"text": "plain", "data": {"delta": [{"insert": "rich"}]}})
+    assert blocks.block_text(document, new) == "rich"
+
+
+def test_insert_tree_stores_data_without_delta():
+    _doc, document = loaded()
+    new = blocks.insert_tree(document, {"type": "heading", "data": {"level": 2, "delta": []}})
+    assert json.loads(document["blocks"][new]["data"]) == {"level": 2}
+
+
+def test_insert_tree_gives_container_blocks_no_text():
+    _doc, document = loaded()
+    new = blocks.insert_tree(document, {"type": "simple_table"})
+    assert document["blocks"][new]["external_id"] == ""
+
+
+def test_insert_tree_text_block_without_content_is_empty():
+    _doc, document = loaded()
+    new = blocks.insert_tree(document, {"type": "paragraph"})
+    assert blocks.block_text(document, new) == ""
+
+
+def test_insert_tree_without_children_map_raises():
+    _doc, document = loaded(with_children_map=False)
+    with pytest.raises(ValueError, match="no children_map"):
+        blocks.insert_tree(document, {"text": "x"})
+
+
+def test_insert_tree_unknown_parent_raises():
+    _doc, document = loaded()
+    with pytest.raises(ValueError, match="not found on this page"):
+        blocks.insert_tree(document, {"text": "x"}, parent_id="ghost")
+
+
+def test_insert_tree_without_page_root_raises():
+    _doc, document = loaded(page_id=None)
+    with pytest.raises(ValueError, match="not found on this page"):
+        blocks.insert_tree(document, {"text": "x"})
+
+
+def test_insert_tree_parent_without_children_array_raises():
+    _doc, document = loaded([{"id": "a", "text": "a", "no_children": True}])
+    with pytest.raises(ValueError, match="has no children array"):
+        blocks.insert_tree(document, {"text": "x"}, parent_id="a")
+
+
+# -- table_node ------------------------------------------------------------
+def test_table_node_pads_short_rows():
+    node = blocks.table_node([["a", "b"], ["c"]])
+    assert [len(r["children"]) for r in node["children"]] == [2, 2]
+
+
+def test_table_node_sets_header_flag():
+    node = blocks.table_node([["a"]], header_row=False)
+    assert node["data"]["enable_header_row"] is False
+
+
+def test_table_node_cell_text_lands_in_paragraph():
+    node = blocks.table_node([["hello"]])
+    assert node["children"][0]["children"][0]["children"][0] == {
+        "type": "paragraph",
+        "text": "hello",
+    }
+
+
+def test_table_node_accepts_delta_cells():
+    node = blocks.table_node([[[{"insert": "b", "attributes": {"bold": True}}]]])
+    para = node["children"][0]["children"][0]["children"][0]
+    assert para["data"]["delta"][0]["insert"] == "b"
+
+
+def test_table_node_empty_cell_has_no_text():
+    node = blocks.table_node([["a", ""]])
+    assert node["children"][0]["children"][1]["children"][0] == {"type": "paragraph"}
+
+
+def test_table_node_without_rows_raises():
+    with pytest.raises(ValueError, match="at least one row"):
+        blocks.table_node([[]])
+
+
+def test_table_node_rejects_non_list_rows():
+    with pytest.raises(ValueError, match="list of lists"):
+        blocks.table_node(["a,b"])

@@ -93,6 +93,7 @@ Helm) and/or a **YAML/JSON file**. Env wins over the file.
 | `APPFLOWY_MCP_REQUIRE_AUTH` | `true` (default) rejects unauthenticated requests; `false` + no tokens = open mode |
 | `APPFLOWY_MCP_FOLDER_CACHE_TTL` | Seconds to cache folder trees for scope checks (default `15`) |
 | `APPFLOWY_MCP_LOG_LEVEL` | `INFO` (default), `DEBUG`, … |
+| `APPFLOWY_MCP_KEEPALIVE_TIMEOUT` | Seconds an idle HTTP connection is kept open (default `75`; uvicorn's own 5 s default resets clients that reuse pooled connections) |
 
 **Tokens via env** — two equivalent forms.
 
@@ -207,21 +208,27 @@ Health check: `GET /healthz` → `{"status":"ok"}`.
 | --- | --- |
 | `Get workspace list` | List workspaces visible to the token |
 | `Get workspace folder` | Page tree of a workspace, pruned to scope |
-| `Create new page` | Create a page under an allowed parent |
-| `Update page` | Rename / set icon / lock |
-| `Get page details` | Full page metadata + content |
-| `Append content to page` | Append blocks to the end |
+| `Create space` | Create a top-level sidebar section (the sidebar only lists spaces) |
+| `Create new page` | Create a page under an allowed parent (not the workspace root) |
+| `Move page` | Move a page and its children under another space/page |
+| `Update page` | Rename / set icon / lock (keeps the current name when omitted) |
+| `Get page details` | Page metadata + content as blocks |
+| `Append content to page` | Append blocks to the end, nested children included |
+| `Insert table` | Insert a table (AppFlowy `simple_table`) from rows of cells |
 | `Get page blocks` | List a page's blocks in order (ids + text) |
 | `Insert block` | Insert a new block at any position (incl. an `image` from a public URL) |
 | `Edit block text` | Replace a block's text/rich content in place |
 | `Delete block` | Delete a leaf block |
-| `Create database` | Create a grid/board/calendar database under a parent |
+| `Create database` | Create a grid/board/calendar; optionally define columns + options in the same call; blank starter rows removed |
 | `Get workspace databases` | List databases (+ their views), scoped |
 | `Get database fields` | List a database's fields/columns |
-| `Add database field` | Add a column (text, number, select, date, …) |
+| `Add database field` | Add a column (text, number, select, date, …); refuses duplicate names |
+| `Rename database field` / `Delete database field` | Rename or remove a column (primary excluded) |
+| `Add select options` | Add options to a single/multi-select column |
 | `List database rows` | List rows, cells keyed by field name (optionally row docs) |
 | `Get database row` | Read one row's cells by id (optionally its doc) |
 | `Create database row` | Add a row from `{field: value}` cells (+ optional markdown doc) |
+| `Create database rows` | Add many rows in one call |
 | `Update database row` | Edit an existing row's cells in place, by row id |
 | `Delete database row` | Remove a row from every view of the database |
 | `Move page to trash` / `Restore page from trash` / `Delete page from trash` | Trash lifecycle |
@@ -236,10 +243,16 @@ Health check: `GET /healthz` → `{"status":"ok"}`.
   reference (nothing is uploaded); remove it with `Delete block` like any block.
 - Database row cells are keyed by field **name or id**; values follow the field
   type (string for text/URL, number for Number, bool for Checkbox, ISO-8601 or
-  unix seconds for DateTime, option name(s) for select). `Create database row`
+  unix seconds for DateTime, option name(s) for select). A DateTime value with a
+  time of day shows the time, and `{"start", "end"}` makes a range; times
+  without an offset are UTC. `Create database row`
   goes through the REST endpoint; `Update database row` and `Delete database row`
   act on an existing row by its id through the CRDT `web-update` path (mirroring
   the web client), since REST exposes no route to edit or delete a row by UUID.
+- Field rename/delete, select options and nested blocks/tables are written
+  through the database/document collab, as REST has no route for them.
+  AppFlowy's `append-block` endpoint misorders nested children (a block whose
+  previous id is not a sibling is inserted first), so nested content bypasses it.
 - Scope checks rely on the workspace folder tree, cached for
   `APPFLOWY_MCP_FOLDER_CACHE_TTL` seconds. Newly created pages invalidate the
   cache for their workspace.

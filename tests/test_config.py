@@ -175,6 +175,7 @@ def test_load_settings_reads_file_and_env_override(tmp_path, monkeypatch):
             "require_auth": False,
             "folder_cache_ttl": 5,
             "log_level": "debug",
+            "keepalive_timeout": 30,
         },
     }
     p = tmp_path / "c.json"
@@ -189,7 +190,14 @@ def test_load_settings_reads_file_and_env_override(tmp_path, monkeypatch):
     assert settings.require_auth is False
     assert settings.folder_cache_ttl == 5.0
     assert settings.log_level == "DEBUG"
+    assert settings.keepalive_timeout == 30
     assert [t.token for t in settings.tokens] == ["file-tok"]
+
+
+def test_load_settings_keepalive_defaults_to_75(monkeypatch):
+    monkeypatch.delenv("APPFLOWY_MCP_CONFIG", raising=False)
+    monkeypatch.delenv("APPFLOWY_MCP_KEEPALIVE_TIMEOUT", raising=False)
+    assert load_settings().keepalive_timeout == 75
 
 
 def test_load_settings_env_token_overrides_file_duplicate(tmp_path, monkeypatch):

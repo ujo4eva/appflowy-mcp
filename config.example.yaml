@@ -13,6 +13,7 @@ server:
   path: /mcp
   require_auth: true
   folder_cache_ttl: 15
+  keepalive_timeout: 75
   log_level: INFO
 
 # Each token grants a set of tree-shaped scopes.

@@ -228,6 +228,67 @@ async def test_append_content_to_page_sends_blocks(fake_client):
     assert fake_client.requests[0][2]["json"] == {"blocks": [{"type": "paragraph"}]}
 
 
+NESTED = [{"type": "bulleted_list", "text": "p", "children": [{"type": "bulleted_list"}]}]
+
+
+async def test_append_content_to_page_nested_goes_through_collab(fake_client):
+    fake_client.page_view_raw = page_view_for(build_collab())
+    await server.append_content_to_page("WS", "P", NESTED)
+    assert fake_client.requests == []
+
+
+async def test_append_content_to_page_nested_returns_block_ids(fake_client):
+    fake_client.page_view_raw = page_view_for(build_collab())
+    result = await server.append_content_to_page("WS", "P", NESTED)
+    assert len(result["block_ids"]) == 1
+
+
+async def test_insert_trees_requires_pycrdt(monkeypatch):
+    monkeypatch.setattr(blocks, "HAS_PYCRDT", False)
+    with pytest.raises(ToolError, match="pycrdt is not installed"):
+        await server._insert_trees("WS", "P", NESTED)
+
+
+async def test_insert_trees_rejects_non_object_block(fake_client):
+    fake_client.page_view_raw = page_view_for(build_collab())
+    with pytest.raises(ToolError, match="block 0 is not an object"):
+        await server._insert_trees("WS", "P", ["text"])
+
+
+async def test_insert_trees_bad_parent_raises(fake_client):
+    fake_client.page_view_raw = page_view_for(build_collab())
+    with pytest.raises(ToolError, match="not found on this page"):
+        await server._insert_trees("WS", "P", NESTED, parent_id="ghost")
+
+
+async def test_insert_trees_positions_consecutive_blocks(fake_client):
+    fake_client.page_view_raw = page_view_for(
+        build_collab(blocks=[{"id": "a", "text": "a"}, {"id": "b", "text": "b"}])
+    )
+    result = await server._insert_trees(
+        "WS", "P", [{"text": "x"}, {"text": "y"}], index=1
+    )
+    assert len(result["block_ids"]) == 2
+
+
+async def test_insert_trees_passes_through_update_error(fake_client):
+    fake_client.page_view_raw = page_view_for(build_collab())
+    fake_client.web_update_result = {"error": "web-update failed"}
+    result = await server._insert_trees("WS", "P", NESTED)
+    assert result == {"error": "web-update failed"}
+
+
+async def test_insert_table_returns_block_id(fake_client):
+    fake_client.page_view_raw = page_view_for(build_collab())
+    result = await server.insert_table("WS", "P", [["a", "b"], ["c"]])
+    assert len(result["block_ids"]) == 1
+
+
+async def test_insert_table_rejects_empty_rows():
+    with pytest.raises(ToolError, match="at least one row"):
+        await server.insert_table("WS", "P", [])
+
+
 # -- block tools: pycrdt gating -------------------------------------------
 async def test_block_tools_require_pycrdt(monkeypatch):
     monkeypatch.setattr(blocks, "HAS_PYCRDT", False)
@@ -480,6 +541,105 @@ async def test_create_database_invalid_layout_raises(fake_client):
         await server.create_database("WS", "parent", layout=0)
 
 
+DEFAULT_DB_FIELDS = [
+    {"id": "n", "name": "Name", "field_type_id": 0, "is_primary": True},
+    {"id": "t", "name": "Type", "field_type_id": 3},
+    {"id": "d", "name": "Done", "field_type_id": 5},
+]
+
+
+def new_database_client(fake_client, added_ids=("new1", "new2"), db_fields=None):
+    """Script the calls create_database makes against a fresh database."""
+    added = iter(added_ids)
+
+    async def request(method, path, **kw):
+        fake_client.requests.append((method, path, kw))
+        if path.endswith("/page-view"):
+            return {"data": {"view_id": "V", "database_id": "DB"}}
+        if path.endswith("/fields") and method == "GET":
+            return {"data": DEFAULT_DB_FIELDS if db_fields is None else db_fields}
+        return {"data": next(added)}
+
+    fake_client.request = request
+    doc = build_fields_doc(
+        {
+            "n": {"name": "Name", "ty": 0, "is_primary": True},
+            "t": {"name": "Type", "ty": 3},
+            "d": {"name": "Done", "ty": 5},
+            "new1": {"name": "Kind", "ty": 3},
+        },
+        {"V": {"field_orders": [{"id": "n"}], "row_orders": [{"id": "r1"}, {"id": "r2"}]}},
+    )
+    fake_client.collabs["DB"] = {"doc_state": list(doc.get_update())}
+
+
+async def test_create_database_strips_placeholder_rows_by_default(fake_client):
+    new_database_client(fake_client)
+    await server.create_database("WS", "parent")
+    assert fake_client.web_updates[-1][1] == "DB"
+
+
+async def test_create_database_keep_placeholder_rows_skips_shaping(fake_client):
+    new_database_client(fake_client)
+    await server.create_database("WS", "parent", keep_placeholder_rows=True)
+    assert fake_client.web_updates == []
+
+
+async def test_create_database_returns_field_ids_by_name(fake_client):
+    new_database_client(fake_client)
+    result = await server.create_database(
+        "WS",
+        "parent",
+        primary_field="Task",
+        fields=[{"name": "Done", "type": 5}, {"name": "Kind", "type": 3, "options": ["A"]}],
+    )
+    assert result["fields"] == {"Task": "n", "Done": "d", "Kind": "new1"}
+
+
+async def test_create_database_keeps_placeholder_rows_while_shaping(fake_client):
+    new_database_client(fake_client)
+    await server.create_database(
+        "WS", "parent", fields=[{"name": "Kind", "type": 3}], keep_placeholder_rows=True
+    )
+    assert fake_client.web_updates[-1][1] == "DB"
+
+
+async def test_create_database_without_primary_field_omits_it(fake_client):
+    new_database_client(fake_client, db_fields=DEFAULT_DB_FIELDS[1:])
+    result = await server.create_database("WS", "parent", primary_field="Task")
+    assert result["fields"] == {}
+
+
+async def test_create_database_adds_unlisted_fields_through_rest(fake_client):
+    new_database_client(fake_client)
+    await server.create_database("WS", "parent", fields=[{"name": "Kind", "type": 3}])
+    posted = [kw["json"] for m, p, kw in fake_client.requests if m == "POST" and p.endswith("/fields")]
+    assert posted == [{"name": "Kind", "field_type": 3}]
+
+
+async def test_create_database_returns_raw_result_without_database_id(fake_client):
+    fake_client.request_result = {"data": {"view_id": "V"}}
+    result = await server.create_database("WS", "parent")
+    assert result == {"data": {"view_id": "V"}}
+
+
+async def test_create_database_without_pycrdt_returns_raw_result(monkeypatch, fake_client):
+    monkeypatch.setattr(blocks, "HAS_PYCRDT", False)
+    fake_client.request_result = {"data": {"view_id": "V", "database_id": "DB"}}
+    result = await server.create_database("WS", "parent")
+    assert "fields" not in result
+
+
+async def test_create_database_field_without_name_raises():
+    with pytest.raises(ToolError, match=r"fields\[0\] needs a 'name'"):
+        await server.create_database("WS", "parent", fields=[{"type": 0}])
+
+
+async def test_create_database_duplicate_field_names_raise():
+    with pytest.raises(ToolError, match="duplicate names"):
+        await server.create_database("WS", "parent", fields=[{"name": "A"}, {"name": "A"}])
+
+
 async def test_get_workspace_databases_returns_filtered(fake_client):
     fake_client.request_result = {"data": [{"id": "DB", "views": [{"view_id": "V"}]}]}
     out = await server.get_workspace_databases("WS")
@@ -586,6 +746,7 @@ async def test_create_database_rejects_workspace_root():
 
 # -- create_database_rows --------------------------------------------------
 async def test_create_database_rows_returns_created_ids(fake_client):
+    fake_client.results["/fields"] = {"data": []}
     fake_client.request_result = {"code": 0, "data": "row-id"}
     result = await server.create_database_rows(
         "WS", "DB", [{"cells": {"Name": "a"}}, {"cells": {"Name": "b"}}]
@@ -594,11 +755,13 @@ async def test_create_database_rows_returns_created_ids(fake_client):
 
 
 async def test_create_database_rows_sends_document(fake_client):
+    fake_client.results["/fields"] = {"data": []}
     await server.create_database_rows("WS", "DB", [{"cells": {}, "document": "# hi"}])
-    assert fake_client.requests[0][2]["json"] == {"cells": {}, "document": "# hi"}
+    assert fake_client.requests[-1][2]["json"] == {"cells": {}, "document": "# hi"}
 
 
-async def test_create_database_rows_rejects_row_without_cells():
+async def test_create_database_rows_rejects_row_without_cells(fake_client):
+    fake_client.results["/fields"] = {"data": []}
     with pytest.raises(ToolError, match=r"rows_to_add\[0\] needs a 'cells' object"):
         await server.create_database_rows("WS", "DB", [{"Name": "a"}])
 
@@ -607,6 +770,8 @@ async def test_create_database_rows_reports_partial_failure(fake_client):
     calls = []
 
     async def flaky(method, path, **kw):
+        if path.endswith("/fields"):
+            return {"data": []}
         calls.append(kw)
         if len(calls) == 2:
             raise AppFlowyError("boom")
@@ -663,13 +828,54 @@ async def test_add_select_options_rejects_empty_list():
 
 
 async def test_create_database_row_minimal(fake_client):
+    fake_client.results["/fields"] = {"data": []}
     await server.create_database_row("WS", "DB", {"Name": "x"})
-    assert fake_client.requests[0][2]["json"] == {"cells": {"Name": "x"}}
+    assert fake_client.requests[-1][2]["json"] == {"cells": {"Name": "x"}}
 
 
 async def test_create_database_row_with_document(fake_client):
+    fake_client.results["/fields"] = {"data": []}
     await server.create_database_row("WS", "DB", {"Name": "x"}, document="# notes")
-    assert fake_client.requests[0][2]["json"]["document"] == "# notes"
+    assert fake_client.requests[-1][2]["json"]["document"] == "# notes"
+
+
+DATE_FIELDS = {
+    "data": [
+        {"id": "f1", "name": "Name", "field_type_id": 0},
+        {"id": "d1", "name": "When", "field_type_id": rows.DATETIME},
+    ]
+}
+
+
+async def test_create_database_row_sends_range_start_to_rest(fake_client):
+    fake_client.results["/fields"] = DATE_FIELDS
+    fake_client.results["/row"] = {"data": "r1"}
+    fake_client.collabs["r1"] = build_row_collab()
+    await server.create_database_row(
+        "WS", "DB", {"When": {"start": "2026-11-23T08:00:00Z", "end": "2026-11-23T11:00:00Z"}}
+    )
+    assert fake_client.requests[-1][2]["json"] == {"cells": {"When": "2026-11-23T08:00:00Z"}}
+
+
+async def test_create_database_row_rewrites_timed_date_in_row_collab(fake_client):
+    fake_client.results["/fields"] = DATE_FIELDS
+    fake_client.results["/row"] = {"data": "r1"}
+    fake_client.collabs["r1"] = build_row_collab()
+    await server.create_database_row("WS", "DB", {"When": "2026-11-17T05:30:00+01:00"})
+    assert fake_client.web_updates[-1][1] == "r1"
+
+
+async def test_create_database_row_date_only_skips_collab_write(fake_client):
+    fake_client.results["/fields"] = DATE_FIELDS
+    await server.create_database_row("WS", "DB", {"When": "2026-12-05"})
+    assert fake_client.web_updates == []
+
+
+async def test_create_database_row_without_pycrdt_skips_collab_write(monkeypatch, fake_client):
+    monkeypatch.setattr(blocks, "HAS_PYCRDT", False)
+    fake_client.results["/fields"] = DATE_FIELDS
+    await server.create_database_row("WS", "DB", {"When": "2026-11-17T05:30:00Z"})
+    assert fake_client.web_updates == []
 
 
 TEXT_FIELDS = {"data": [{"id": "f1", "name": "Name", "field_type_id": 0}]}
@@ -824,6 +1030,15 @@ def test_main_open_mode(monkeypatch):
     monkeypatch.setattr(server.mcp, "run", lambda **kw: runs.append(kw))
     server.main()
     assert runs[0]["host"] == settings.host
+
+
+def test_main_passes_keepalive_timeout_to_uvicorn(monkeypatch):
+    settings = Settings(appflowy=AppFlowyConfig(), require_auth=False, keepalive_timeout=90)
+    monkeypatch.setattr(server, "load_settings", lambda: settings)
+    runs = []
+    monkeypatch.setattr(server.mcp, "run", lambda **kw: runs.append(kw))
+    server.main()
+    assert runs[0]["uvicorn_config"] == {"timeout_keep_alive": 90}
 
 
 def test_package_main_module_is_importable():

@@ -252,13 +252,22 @@ async def append_content_to_page(
     """Append blocks to the END of an existing page (cannot edit existing
     blocks — use 'Edit block text'/'Insert block' for that).
 
+    Blocks may nest via "children" (e.g. sub-bullets). For tables use 'Insert
+    table'.
+
     Args:
         workspace_id: The workspace containing the page.
         page_id: The page to append to; must be within your scope.
         blocks_to_add: List of block objects like
-            {"type": "paragraph", "data": {"delta": [{"insert": "Hello"}]}}.
+            {"type": "paragraph", "data": {"delta": [{"insert": "Hello"}]}},
+            optionally with "children": [<block>, ...].
     """
     await _guard_view(workspace_id, page_id)
+    if any(isinstance(b, dict) and b.get("children") for b in blocks_to_add):
+        # AppFlowy's append-block endpoint misorders nested children (a block
+        # whose previous id is not a sibling lands first), so nested content is
+        # written through the collab instead.
+        return await _insert_trees(workspace_id, page_id, blocks_to_add)
     return await _api(
         "POST",
         f"/api/workspace/{workspace_id}/page-view/{page_id}/append-block",
@@ -543,6 +552,58 @@ async def delete_block(workspace_id: str, page_id: str, block_id: str) -> Any:
     return await CLIENT.post_web_update(workspace_id, page_id, update)
 
 
+async def _insert_trees(
+    workspace_id: str, page_id: str, nodes: list, parent_id: str = "", index: int = -1
+) -> Any:
+    """Insert block trees in one collab update; returns the new top-level ids."""
+    if not blocks.HAS_PYCRDT:
+        raise ToolError("pycrdt is not installed; block tools are unavailable")
+    doc, document = await _load_page_document(workspace_id, page_id)
+    state = doc.get_state()
+    new_ids: list = []
+    try:
+        with doc.transaction():
+            for offset, node in enumerate(nodes):
+                if not isinstance(node, dict):
+                    raise ValueError(f"block {offset} is not an object")
+                pos = index if index < 0 else index + offset
+                new_ids.append(blocks.insert_tree(document, node, parent_id, pos))
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+    result = await CLIENT.post_web_update(workspace_id, page_id, doc.get_update(state))
+    if isinstance(result, dict) and not result.get("error"):
+        return {"block_ids": new_ids, **result}
+    return result
+
+
+@mcp.tool(name="insert_table")
+async def insert_table(
+    workspace_id: str,
+    page_id: str,
+    rows: list,
+    header_row: bool = True,
+    parent_id: str = "",
+    index: int = -1,
+) -> Any:
+    """Insert a table block (the kind AppFlowy's /table command makes).
+
+    Args:
+        workspace_id: The workspace containing the page.
+        page_id: The page to insert into; must be within your scope.
+        rows: Rows of cells; each cell is plain text or a rich-text delta list.
+            Short rows are padded. E.g. [["Day", "Class"], ["Mon", "MEE 515"]].
+        header_row: Style the first row as a header.
+        parent_id: Block id to nest under; "" = page root.
+        index: 0-based position among the parent's children; -1 = append.
+    """
+    await _guard_view(workspace_id, page_id)
+    try:
+        node = blocks.table_node(rows, header_row)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+    return await _insert_trees(workspace_id, page_id, [node], parent_id, index)
+
+
 # --------------------------------------------------------------------------
 # Databases (grids / boards / calendars)
 # --------------------------------------------------------------------------
@@ -581,27 +642,61 @@ async def _guard_database(workspace_id: str, database_id: str):
     return tok
 
 
+def _field_specs(raw: list) -> list:
+    specs = []
+    for i, spec in enumerate(raw):
+        if not isinstance(spec, dict) or not str(spec.get("name") or "").strip():
+            raise ToolError(f"fields[{i}] needs a 'name'")
+        specs.append(
+            {
+                "name": str(spec["name"]).strip(),
+                "type": int(spec.get("type", 0)),
+                "options": [str(o) for o in spec.get("options") or []],
+            }
+        )
+    names = [s["name"] for s in specs]
+    if len(set(names)) != len(names):
+        raise ToolError("fields contains duplicate names")
+    return specs
+
+
 @mcp.tool(name="create_database")
 async def create_database(
-    workspace_id: str, parent_view_id: str, name: str = "", layout: int = 1
+    workspace_id: str,
+    parent_view_id: str,
+    name: str = "",
+    layout: int = 1,
+    fields: list | None = None,
+    primary_field: str | None = None,
+    keep_placeholder_rows: bool = False,
 ) -> Any:
     """Create a new database (grid/board/calendar) under a parent view.
 
-    Returns the new view_id and database_id. The database starts with default
-    fields (Name, Type, Done) and a few empty rows; use 'Add database field' and
-    'Add database row' to shape and fill it. (For a plain document, use 'Create
-    new page' instead.)
+    AppFlowy seeds new databases with Name/Type/Done columns and a few blank
+    rows. The blank rows are removed unless keep_placeholder_rows is set. Pass
+    ``fields`` to define the columns in the same call: the default Type and Done
+    columns are then dropped unless listed (same name and type), and select
+    options are created. (For a plain document, use 'Create new page'.)
+
+    Returns view_id, database_id and {column name: field id}.
 
     Args:
         workspace_id: The workspace to create in.
         parent_view_id: The parent view/folder; must be within your scope.
         name: Optional database title.
         layout: 1=Grid, 2=Board, 3=Calendar.
+        fields: Optional columns besides the primary one, e.g.
+            [{"name": "Due", "type": 2}, {"name": "Kind", "type": 3,
+              "options": ["Exam", "Revision"]}]. type uses the codes listed in
+            'Add database field' (default 0 = Text).
+        primary_field: Optional new name for the primary "Name" column.
+        keep_placeholder_rows: Keep AppFlowy's blank starter rows.
     """
     _reject_workspace_root(workspace_id, parent_view_id)
     await _guard_view(workspace_id, parent_view_id)
     if layout not in (1, 2, 3):
         raise ToolError("layout must be 1 (Grid), 2 (Board), or 3 (Calendar)")
+    specs = _field_specs(fields or [])
     json_data: dict[str, Any] = {"parent_view_id": parent_view_id, "layout": layout}
     if name:
         json_data["name"] = name
@@ -609,7 +704,69 @@ async def create_database(
         "POST", f"/api/workspace/{workspace_id}/page-view", json=json_data
     )
     ACCESS.invalidate(workspace_id)
-    return result
+    if not (specs or primary_field or not keep_placeholder_rows):
+        return result
+    created = unwrap(result)
+    database_id = created.get("database_id") if isinstance(created, dict) else None
+    if not database_id or not blocks.HAS_PYCRDT:
+        return result
+    return {
+        **created,
+        "fields": await _shape_new_database(
+            workspace_id, database_id, specs, primary_field, keep_placeholder_rows
+        ),
+    }
+
+
+async def _shape_new_database(
+    workspace_id: str,
+    database_id: str,
+    specs: list,
+    primary_field: str | None,
+    keep_placeholder_rows: bool,
+) -> dict:
+    existing = await _database_fields(workspace_id, database_id)
+    primary = next((f for f in existing if f.get("is_primary")), None)
+    defaults = [f for f in existing if not f.get("is_primary")]
+    ids: dict = {}
+    reused: set = set()
+    for spec in specs:
+        match = next(
+            (
+                f
+                for f in defaults
+                if f.get("name") == spec["name"] and f.get("field_type_id") == spec["type"]
+            ),
+            None,
+        )
+        if match:
+            ids[spec["name"]] = match["id"]
+            reused.add(match["id"])
+            continue
+        added = await _api(
+            "POST",
+            f"/api/workspace/{workspace_id}/database/{database_id}/fields",
+            json={"name": spec["name"], "field_type": spec["type"]},
+        )
+        ids[spec["name"]] = unwrap(added)
+
+    def edit(doc):
+        if specs:
+            for f in defaults:
+                if f["id"] not in reused:
+                    fields.delete_field(doc, f["id"])
+        if primary_field and primary:
+            fields.rename_field(doc, primary["id"], primary_field)
+        for spec in specs:
+            if spec["options"]:
+                fields.add_select_options(doc, ids[spec["name"]], spec["options"])
+        if not keep_placeholder_rows:
+            rows.clear_row_orders(doc)
+
+    await _edit_database_collab(workspace_id, database_id, edit)
+    if primary:
+        ids = {primary_field or primary.get("name"): primary["id"], **ids}
+    return ids
 
 
 @mcp.tool(name="get_workspace_databases")
@@ -766,17 +923,50 @@ async def create_database_row(
         workspace_id: The workspace containing the database.
         database_id: The database to edit; must be within your scope.
         cells: {field name (or id): value} — string for Text/URL, number for
-            Number, bool for Checkbox, ISO-8601 string for DateTime, option name
-            for SingleSelect. Unknown fields are ignored by AppFlowy.
+            Number, bool for Checkbox, option name for SingleSelect. DateTime
+            takes ISO-8601 or unix seconds; a time of day (e.g.
+            "2026-11-17T05:30:00+01:00") shows the time, and {"start", "end"}
+            makes a range. Times without an offset are UTC. Unknown fields are
+            ignored by AppFlowy.
         document: Optional markdown for the row's detail document.
     """
     await _guard_database(workspace_id, database_id)
-    body: dict[str, Any] = {"cells": cells}
+    fields_list = await _database_fields(workspace_id, database_id)
+    return await _create_row(workspace_id, database_id, cells, document, fields_list)
+
+
+def _timed_dates(fields_list: list, cells: dict) -> dict:
+    """DateTime cells whose time or range the REST create would drop."""
+    index = rows.field_index(fields_list)
+    return {
+        key: value
+        for key, value in cells.items()
+        if (index.get(key) or {}).get("field_type_id") == rows.DATETIME
+        and (isinstance(value, dict) or rows._has_time(value))
+    }
+
+
+async def _create_row(
+    workspace_id: str,
+    database_id: str,
+    cells: dict,
+    document: str | None,
+    fields_list: list,
+) -> Any:
+    timed = _timed_dates(fields_list, cells)
+    rest_cells = {
+        k: (v.get("start") if isinstance(v, dict) else v) if k in timed else v
+        for k, v in cells.items()
+    }
+    body: dict[str, Any] = {"cells": rest_cells}
     if document is not None:
         body["document"] = document
-    return await _api(
+    result = await _api(
         "POST", f"/api/workspace/{workspace_id}/database/{database_id}/row", json=body
     )
+    if timed and blocks.HAS_PYCRDT:
+        await _write_row_cells(workspace_id, unwrap(result), timed, fields_list)
+    return result
 
 
 @mcp.tool(name="create_database_rows")
@@ -796,18 +986,18 @@ async def create_database_rows(
             with cells as in 'Create database row'.
     """
     await _guard_database(workspace_id, database_id)
-    path = f"/api/workspace/{workspace_id}/database/{database_id}/row"
+    fields_list = await _database_fields(workspace_id, database_id)
     created: list = []
     for i, row in enumerate(rows_to_add):
         if not isinstance(row, dict) or not isinstance(row.get("cells"), dict):
             raise ToolError(f"rows_to_add[{i}] needs a 'cells' object; created so far: {created}")
-        body: dict[str, Any] = {"cells": row["cells"]}
-        if row.get("document") is not None:
-            body["document"] = row["document"]
         try:
-            created.append(unwrap(await CLIENT.request("POST", path, json=body)))
-        except AppFlowyError as exc:
+            result = await _create_row(
+                workspace_id, database_id, row["cells"], row.get("document"), fields_list
+            )
+        except ToolError as exc:
             raise ToolError(f"rows_to_add[{i}] failed: {exc}; created so far: {created}") from exc
+        created.append(unwrap(result))
     return {"created": created}
 
 
@@ -843,16 +1033,21 @@ async def update_database_row(
         row_id: The row to update (from 'List database rows').
         cells: {field name (or id): value} — string for Text/URL, number for
             Number, bool for Checkbox, ISO-8601 string or unix seconds for
-            DateTime, option name (or id) for SingleSelect, list of option names
-            for MultiSelect. Call 'Get database fields' for the names and
+            DateTime ({"start", "end"} for a range; a time of day shows the
+            time; times without an offset are UTC), option name (or id) for
+            SingleSelect, list of option names for MultiSelect. Call 'Get database fields' for the names and
             options. An unknown field name is an error, not a silent no-op.
     """
     if not blocks.HAS_PYCRDT:
         raise ToolError("pycrdt is not installed; row editing is unavailable")
     await _guard_database(workspace_id, database_id)
-    fields = await _database_fields(workspace_id, database_id)
+    fields_list = await _database_fields(workspace_id, database_id)
+    return await _write_row_cells(workspace_id, row_id, cells, fields_list)
+
+
+async def _write_row_cells(workspace_id: str, row_id: str, cells: dict, fields_list: list) -> Any:
     try:
-        resolved = rows.resolve_cells(fields, cells)
+        resolved = rows.resolve_cells(fields_list, cells)
     except ValueError as exc:
         raise ToolError(str(exc)) from exc
     doc = await _load_collab(workspace_id, row_id, rows.COLLAB_DATABASE_ROW)
@@ -1141,6 +1336,7 @@ def main() -> None:
         host=settings.host,
         port=settings.port,
         path=settings.path,
+        uvicorn_config={"timeout_keep_alive": settings.keepalive_timeout},
     )
 
 

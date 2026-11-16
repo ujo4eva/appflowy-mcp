@@ -75,6 +75,34 @@ def _timestamp(value: Any) -> str:
         raise ValueError(f"{text!r} is not a unix timestamp or ISO-8601 date") from exc
 
 
+def _has_time(value: Any) -> bool:
+    """Whether a date value carries a time of day (vs. a bare date)."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return int(value) % 86400 != 0
+    text = str(value).strip()
+    if text.isdigit():
+        return int(text) % 86400 != 0
+    return "T" in text or ":" in text
+
+
+def date_extras(value: Any) -> dict:
+    """The extra keys a DateTime cell stores next to its start timestamp.
+
+    ``value`` is a date (ISO-8601 or unix seconds) or ``{"start", "end"}`` for a
+    range. A time of day on either end turns on ``include_time``.
+    """
+    if isinstance(value, dict):
+        if "start" not in value:
+            raise ValueError("a date range needs a 'start'")
+        end = value.get("end")
+        return {
+            "include_time": _has_time(value["start"]) or (end is not None and _has_time(end)),
+            "is_range": end is not None,
+            "end_timestamp": _timestamp(end) if end is not None else "",
+        }
+    return {"include_time": _has_time(value), "is_range": False, "end_timestamp": ""}
+
+
 def encode_cell(field: dict, value: Any) -> str:
     """Encode a Python value into the string AppFlowy stores for this field type."""
     field_type = field.get("field_type_id")
@@ -83,7 +111,7 @@ def encode_cell(field: dict, value: Any) -> str:
             return "true" if value.strip().lower() in ("true", "yes", "1") else "false"
         return "true" if value else "false"
     if field_type == DATETIME:
-        return _timestamp(value)
+        return _timestamp(value["start"] if isinstance(value, dict) else value)
     if field_type == SINGLE_SELECT:
         return _option_id(field, value)
     if field_type == MULTI_SELECT:
@@ -107,7 +135,12 @@ def resolve_cells(fields: list, cells: dict) -> dict:
         if field is None:
             known = ", ".join(repr(f["name"]) for f in fields if f.get("name"))
             raise ValueError(f"unknown field {key!r}; this database has: {known}")
-        resolved[field["id"]] = (field.get("field_type_id"), encode_cell(field, value))
+        field_type = field.get("field_type_id")
+        encoded = encode_cell(field, value)
+        if field_type == DATETIME:
+            resolved[field["id"]] = (field_type, encoded, date_extras(value))
+        else:
+            resolved[field["id"]] = (field_type, encoded)
     return resolved
 
 
@@ -125,12 +158,15 @@ def write_cells(doc, resolved: dict) -> None:
         raise ValueError("row collab has no cells map")
     cells = data["cells"]
     now = int(time.time())
-    for field_id, (field_type, encoded) in resolved.items():
+    for field_id, (field_type, encoded, *rest) in resolved.items():
+        extras = rest[0] if rest else {}
         if field_id in blocks.ykeys(cells):
             cell = cells[field_id]
             cell["field_type"] = field_type
             cell["data"] = encoded
             cell["last_modified"] = now
+            for key, val in extras.items():
+                cell[key] = val
         else:
             cells[field_id] = blocks.YMap(
                 {
@@ -138,6 +174,7 @@ def write_cells(doc, resolved: dict) -> None:
                     "data": encoded,
                     "created_at": now,
                     "last_modified": now,
+                    **extras,
                 }
             )
     data["last_modified"] = now
@@ -158,4 +195,22 @@ def remove_row_orders(doc, row_id: str) -> int:
             if orders[i].get("id") == row_id:
                 del orders[i]
                 removed += 1
+    return removed
+
+
+def clear_row_orders(doc) -> int:
+    """Strip every RowOrder from every view; returns how many were removed.
+
+    Used on a freshly created database, whose rows are all blank placeholders.
+    """
+    views = doc.get("data", type=blocks.YMap)["database"]["views"]
+    removed = 0
+    for view_id in blocks.ykeys(views):
+        view = views[view_id]
+        if "row_orders" not in blocks.ykeys(view):
+            continue
+        orders = view["row_orders"]
+        removed += len(orders)
+        if len(orders):
+            del orders[0 : len(orders)]
     return removed
